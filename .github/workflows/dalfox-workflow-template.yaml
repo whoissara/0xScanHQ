@@ -1,0 +1,262 @@
+name: "Dalfox XSS Scanner (Parallel)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_name:
+        description: 'Name of target folder in storage repo'
+        required: true
+      storage_repo:
+        description: 'SSH URL of scan-results-storage repo'
+        required: true
+      custom_cookie:
+        description: 'Optional: Custom Cookie header'
+        required: false
+        default: ''
+      custom_header:
+        description: 'Optional: Custom extra header'
+        required: false
+        default: ''
+
+jobs:
+  fetch-results:
+    runs-on: ubuntu-latest
+    outputs:
+      urls_exist: ${{ steps.check_files.outputs.urls_exist }}
+    steps:
+      - name: Setup SSH and Git
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Clone storage repo and copy files
+        run: |
+          git clone ${{ github.event.inputs.storage_repo }} storage
+          mkdir -p combined-results
+          cp storage/${{ github.event.inputs.target_name }}/discovery/live-urls.txt combined-results/ 2>/dev/null || echo "No live-urls.txt file found"
+          cp storage/${{ github.event.inputs.target_name }}/discovery/params.txt combined-results/ 2>/dev/null || echo "No params.txt file found"
+      - name: Check if files exist
+        id: check_files
+        run: |
+          if [[ -s "combined-results/live-urls.txt" ]]; then
+            echo "urls_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "urls_exist=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Upload combined results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dalfox-combined-results-artifact
+          path: combined-results/
+
+  generate-matrix:
+    runs-on: ubuntu-latest
+    needs: fetch-results
+    if: "needs.fetch-results.outputs.urls_exist == 'true'"
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dalfox-combined-results-artifact
+          path: combined-results/
+      - name: Generate Matrix
+        id: generate-matrix
+        run: |
+          echo "--- STARTING MATRIX GENERATION FOR DALFOX ---"
+          URL_FILE="combined-results/live-urls.txt"
+
+          if [ ! -s "$URL_FILE" ]; then
+            echo "URL file does not exist or is empty. Exiting."
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          LINES_PER_CHUNK=300
+          MAX_JOBS=256
+          MAX_LINES=$((MAX_JOBS * LINES_PER_CHUNK))
+
+          TOTAL_LINES=$(wc -l < "$URL_FILE")
+
+          echo "LINES_PER_CHUNK: $LINES_PER_CHUNK"
+          echo "MAX_JOBS: $MAX_JOBS"
+          echo "MAX_LINES: $MAX_LINES"
+          echo "TOTAL_LINES: $TOTAL_LINES"
+
+          if [ "$TOTAL_LINES" -gt "$MAX_LINES" ]; then
+            echo "Truncating file..."
+            head -n "$MAX_LINES" "$URL_FILE" > "${URL_FILE}.tmp" && mv "${URL_FILE}.tmp" "$URL_FILE"
+            TOTAL_LINES=$(wc -l < "$URL_FILE") # Recalculate after truncation
+            echo "NEW_TOTAL_LINES: $TOTAL_LINES"
+          else
+            echo "No truncation needed."
+          fi
+
+          CHUNKS=$(( (TOTAL_LINES + LINES_PER_CHUNK - 1) / LINES_PER_CHUNK ))
+          echo "CALCULATED_CHUNKS: $CHUNKS"
+
+          MATRIX='{"include":['
+          IS_FIRST_ITEM=true
+          for i in $(seq 1 $CHUNKS); do
+            if [ "$IS_FIRST_ITEM" = true ]; then
+              IS_FIRST_ITEM=false
+            else
+              MATRIX="$MATRIX,"
+            fi
+            MATRIX="$MATRIX{\"chunk\":$i}"
+          done
+          MATRIX="$MATRIX]}"
+          echo "Final matrix object will have $CHUNKS chunks."
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "--- FINISHED MATRIX GENERATION ---"
+
+  dalfox-scan:
+    needs: [fetch-results, generate-matrix]
+    if: "needs.fetch-results.outputs.urls_exist == 'true'"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v3
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dalfox-combined-results-artifact
+          path: combined-results/
+      - name: Setup Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.23'
+      - name: Install Dalfox
+        run: go install github.com/hahwul/dalfox/v2@latest
+      - name: Generate URL chunk file
+        run: |
+          if [ -s combined-results/live-urls.txt ]; then
+            LINES_PER_CHUNK=300
+            START_LINE=$((((${{ matrix.chunk }} - 1) * LINES_PER_CHUNK) + 1))
+            END_LINE=$((${{ matrix.chunk }} * LINES_PER_CHUNK))
+            sed -n "${START_LINE},${END_LINE}p" combined-results/live-urls.txt > dalfox-chunk-${{ matrix.chunk }}.txt
+          else
+            touch dalfox-chunk-${{ matrix.chunk }}.txt
+          fi
+      - name: Hydrate URLs
+        id: hydrate
+        run: |
+          CHUNK_FILE="dalfox-chunk-${{ matrix.chunk }}.txt"
+          PARAMS_FILE="combined-results/params.txt"
+          HYDRATED_FILE="hydrated-dalfox-urls-${{ matrix.chunk }}.txt"
+          touch "$HYDRATED_FILE"
+
+          if [[ ! -s "$CHUNK_FILE" ]] || [[ ! -s "$PARAMS_FILE" ]]; then
+            echo "URL chunk or params file is empty, skipping hydration."
+            exit 0
+          fi
+
+          while IFS= read -r url; do
+            if [[ "$url" == *"?"* ]]; then
+              # If URL already has params, use it as is
+              echo "$url" >> "$HYDRATED_FILE"
+            else
+              # If URL has no params, append each param from params.txt
+              while IFS= read -r param; do
+                echo "${url}?${param}=FUZZ" >> "$HYDRATED_FILE"
+              done < "$PARAMS_FILE"
+            fi
+          done < "$CHUNK_FILE"
+      - name: Run Dalfox Scan on Chunk
+        run: |
+          set -e
+          INPUT_FILE="hydrated-dalfox-urls-${{ matrix.chunk }}.txt"
+          FINAL_OUTPUT_FILE="dalfox-output-${{ matrix.chunk }}.txt"
+          TEMP_DIR="temp-dalfox-results-${{ matrix.chunk }}"
+          mkdir -p "$TEMP_DIR"
+
+          PAYLOAD_FILE="dalfox_payload.txt" # This file should exist in the repo
+          BLIND_XSS_URL="https://1.bigdav.ir/dalfox-${{ github.event.inputs.target_name }}"
+
+          if [ ! -s "$INPUT_FILE" ]; then
+            echo "URL chunk file is empty, skipping Dalfox scan for this chunk."
+            touch "$FINAL_OUTPUT_FILE"
+            exit 0
+          fi
+
+          # Build header arguments
+          HEADER_ARGS=()
+          if [[ -n "${{ github.event.inputs.custom_cookie }}" ]]; then
+            HEADER_ARGS+=(-H "Cookie: ${{ github.event.inputs.custom_cookie }}")
+          fi
+          if [[ -n "${{ github.event.inputs.custom_header }}" ]]; then
+            HEADER_ARGS+=(-H "${{ github.event.inputs.custom_header }}")
+          fi
+
+          # Loop through each hydrated URL and run dalfox individually
+          COUNTER=0
+          while IFS= read -r url; do
+            COUNTER=$((COUNTER+1))
+            TEMP_FILE="$TEMP_DIR/result-$COUNTER.txt"
+            echo "Scanning URL: $url"
+            # Use -o to save a clean report for each URL to a temporary file
+            (timeout 300 $HOME/go/bin/dalfox url "$url" \
+              --custom-payload "$PAYLOAD_FILE" \
+              -b "$BLIND_XSS_URL" \
+              --skip-headless \
+              --fast-scan \
+              --skip-mining-all \
+              -o "$TEMP_FILE" \
+              "${HEADER_ARGS[@]}") || true
+          done < "$INPUT_FILE"
+
+          # Consolidate all temporary results into the final output file, if any
+          touch "$FINAL_OUTPUT_FILE"
+          if ls "$TEMP_DIR"/*.txt >/dev/null 2>&1; then
+            cat "$TEMP_DIR"/*.txt > "$FINAL_OUTPUT_FILE"
+          fi
+      - name: Upload Dalfox results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dalfox-results-chunk-${{ matrix.chunk }}
+          path: dalfox-output-${{ matrix.chunk }}.txt
+
+  push-to-storage:
+    needs: [dalfox-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup SSH and Git
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+      - name: Push results to storage repo
+        run: |
+          git clone ${{ github.event.inputs.storage_repo }} storage
+          mkdir -p storage/${{ github.event.inputs.target_name }}/xss
+
+          DALFOX_FILE="storage/${{ github.event.inputs.target_name }}/xss/dalfox.txt"
+
+          # Consolidate all dalfox output into a single file
+          find all-results -type f -name "dalfox-output-*.txt" -exec cat {} + > "$DALFOX_FILE"
+
+          cd storage
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "Add parallel Dalfox scan results for ${{ github.event.inputs.target_name }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
