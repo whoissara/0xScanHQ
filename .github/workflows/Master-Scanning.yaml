@@ -219,7 +219,7 @@ jobs:
           if [[ "$SCANNERS" == *"x8"* || "$SCANNERS" == *"kxss"* ]]; then
             echo "Triggering X8/KXSS..."
             curl -s -X POST -H "Authorization: token $GH_PAT" -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/bigidavii/Xss-Scanner/actions/workflows/x8-kxss-workflow.yaml/dispatches \
+              https://api.github.com/repos/jack-daniel23/Xss-Scanner/actions/workflows/x8-kxss-workflow.yaml/dispatches \
               -d '{
                 "ref": "main", "inputs": {
                   "target_name": "'"${{ matrix.domain }}"'", "storage_repo": "'"$STORAGE_REPO"'",
