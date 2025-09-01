@@ -1,0 +1,294 @@
+name: "XSS Scanner Workflow"
+
+concurrency:
+  # Unique group per workflow run to prevent auto-cancel
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  LINES_PER_CHUNK: 500
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_name:
+        description: 'Name of target folder in storage repo'
+        required: true
+      storage_repo:
+        description: 'SSH URL of scan-results-storage repo'
+        required: true
+      custom_cookie:
+        description: 'Optional: Custom Cookie header'
+        required: false
+        default: ''
+      custom_header:
+        description: 'Optional: Custom extra header'
+        required: false
+        default: ''
+      run_x8:
+        description: 'Run the x8 scanner?'
+        required: true
+        type: boolean
+      run_kxss:
+        description: 'Run the kxss scanner?'
+        required: true
+        type: boolean
+
+jobs:
+  fetch-results:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      urls_exist: ${{ steps.check_files.outputs.urls_exist }}
+      params_exist: ${{ steps.check_files.outputs.params_exist }}
+    steps:
+      - name: Setup SSH and Git
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Clone storage repo and copy files
+        run: |
+          git clone ${{ github.event.inputs.storage_repo }} storage
+          mkdir -p combined-results
+          cp storage/${{ github.event.inputs.target_name }}/discovery/* combined-results/ 2>/dev/null || echo "No files to copy"
+      - name: Check if files exist
+        id: check_files
+        run: |
+          if [[ -s "combined-results/live-urls.txt" ]]; then
+            echo "urls_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "urls_exist=false" >> $GITHUB_OUTPUT
+          fi
+          if [[ -s "combined-results/params.txt" ]]; then
+            echo "params_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "params_exist=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Upload combined results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-results-artifact
+          path: combined-results/
+
+  generate-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: fetch-results
+    if: "needs.fetch-results.outputs.urls_exist == 'true'"
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: combined-results-artifact
+          path: combined-results/
+      - name: Generate Matrix
+        id: generate-matrix
+        run: |
+          echo "--- STARTING MATRIX GENERATION FOR X8/KXSS ---"
+          URL_FILE="combined-results/live-urls.txt"
+
+          if [ ! -s "$URL_FILE" ]; then
+            echo "URL file does not exist or is empty. Exiting."
+            echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TOTAL_LINES=$(wc -l < "$URL_FILE")
+          echo "LINES_PER_CHUNK: $LINES_PER_CHUNK"
+          echo "TOTAL_LINES: $TOTAL_LINES"
+
+          CHUNKS=$(( (TOTAL_LINES + LINES_PER_CHUNK - 1) / LINES_PER_CHUNK ))
+          echo "CALCULATED_CHUNKS: $CHUNKS"
+
+          if [ "$CHUNKS" -gt 256 ]; then
+            echo "Warning: Calculated chunks ($CHUNKS) exceeds GitHub's maximum matrix size of 256."
+            echo "Consider increasing LINES_PER_CHUNK to reduce the number of jobs."
+          fi
+
+          MATRIX='{"include":['
+          IS_FIRST_ITEM=true
+          for i in $(seq 1 $CHUNKS); do
+            if [ "$IS_FIRST_ITEM" = true ]; then
+              IS_FIRST_ITEM=false
+            else
+              MATRIX="$MATRIX,"
+            fi
+            MATRIX="$MATRIX{\"chunk\":$i}"
+          done
+          MATRIX="$MATRIX]}"
+          echo "Final matrix object will have $CHUNKS chunks."
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "--- FINISHED MATRIX GENERATION ---"
+
+  x8-scan:
+    needs: [fetch-results, generate-matrix]
+    if: "github.event.inputs.run_x8 == 'true' && needs.fetch-results.outputs.urls_exist == 'true' && needs.fetch-results.outputs.params_exist == 'true'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: combined-results-artifact
+          path: combined-results/
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y expect
+      - name: Install x8
+        run: |
+          wget https://github.com/Sh1Yo/x8/releases/latest/download/x8-linux-x86_64 -O x8 && chmod +x x8 && sudo mv x8 /usr/local/bin/ && exit 0
+          echo "Failed to download x8 binary, trying with cargo"
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          source "$HOME/.cargo/env"
+          cargo install x8
+          sudo cp $HOME/.cargo/bin/x8 /usr/local/bin/x8
+      - name: Generate chunk file
+        run: |
+          if [ -s combined-results/live-urls.txt ]; then
+            START_LINE=$((((${{ matrix.chunk }} - 1) * LINES_PER_CHUNK) + 1))
+            END_LINE=$((${{ matrix.chunk }} * LINES_PER_CHUNK))
+            sed -n "${START_LINE},${END_LINE}p" combined-results/live-urls.txt > x8-chunk-${{ matrix.chunk }}.txt
+          else
+            touch x8-chunk-${{ matrix.chunk }}.txt
+          fi
+      - name: Run x8 and capture output
+        env:
+          CUSTOM_COOKIE: ${{ github.event.inputs.custom_cookie }}
+          CUSTOM_HEADER: ${{ github.event.inputs.custom_header }}
+        run: |
+          mkdir -p x8-results-${{ matrix.chunk }}
+          HEADER_ARGS=()
+          if [[ -n "$CUSTOM_COOKIE" ]]; then
+            HEADER_ARGS+=(-H "Cookie: $CUSTOM_COOKIE")
+          fi
+          if [[ -n "$CUSTOM_HEADER" ]]; then
+            HEADER_ARGS+=(-H "$CUSTOM_HEADER")
+          fi
+
+          if [[ -s "x8-chunk-${{ matrix.chunk }}.txt" ]]; then
+            INPUT_FILE="x8-chunk-${{ matrix.chunk }}.txt"
+            OUTPUT_FILE="x8-results-${{ matrix.chunk }}/x8.txt"
+            unbuffer x8 -u "$INPUT_FILE" -w combined-results/params.txt "${HEADER_ARGS[@]}" 2>&1 | sed -r "s/\x1B\[[0-9;]*[mGK]//g" > "$OUTPUT_FILE"
+          else
+            touch x8-results-${{ matrix.chunk }}/x8.txt
+          fi
+      - name: Extract reflected/injectable params from x8
+        run: |
+          grep -Ei 'reflects|change reflect' x8-results-${{ matrix.chunk }}/x8.txt > x8-results-${{ matrix.chunk }}/x8-reflected.txt || true
+      - name: Upload x8 results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x8-results-chunk-${{ matrix.chunk }}
+          path: x8-results-${{ matrix.chunk }}/
+
+  kxss-scan:
+    needs: [fetch-results, generate-matrix]
+    if: "github.event.inputs.run_kxss == 'true' && needs.fetch-results.outputs.urls_exist == 'true' && needs.fetch-results.outputs.params_exist == 'true'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: combined-results-artifact
+          path: combined-results/
+      - name: Install kxss
+        run: |
+          go install github.com/Emoe/kxss@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Run kxss on consolidated results
+        env:
+          CUSTOM_COOKIE: ${{ github.event.inputs.custom_cookie }}
+          CUSTOM_HEADER: ${{ github.event.inputs.custom_header }}
+        run: |
+          HEADER_ARGS=()
+          if [[ -n "$CUSTOM_COOKIE" ]]; then
+            HEADER_ARGS+=(-header "Cookie: $CUSTOM_COOKIE")
+          fi
+          if [[ -n "$CUSTOM_HEADER" ]]; then
+            HEADER_ARGS+=(-header "$CUSTOM_HEADER")
+          fi
+
+          mkdir -p kxss-results-${{ matrix.chunk }}
+          if [ -s combined-results/live-urls.txt ]; then
+            START_LINE=$((((${{ matrix.chunk }} - 1) * LINES_PER_CHUNK) + 1))
+            END_LINE=$((${{ matrix.chunk }} * LINES_PER_CHUNK))
+            sed -n "${START_LINE},${END_LINE}p" combined-results/live-urls.txt > kxss-urls-${{ matrix.chunk }}.txt
+
+            if [[ -s "kxss-urls-${{ matrix.chunk }}.txt" ]]; then
+              cat kxss-urls-${{ matrix.chunk }}.txt | while IFS= read -r url; do
+                while IFS= read -r param; do
+                  if [[ "$url" == *"?"* ]]; then
+                    echo "${url}&${param}=KXSS"
+                  else
+                    echo "${url}?${param}=KXSS"
+                  fi
+                done < combined-results/params.txt
+              done | sort -u | kxss -timeout 300 -threads 50 "${HEADER_ARGS[@]}" > kxss-results-${{ matrix.chunk }}/kxss-output.txt
+            else
+              touch kxss-results-${{ matrix.chunk }}/kxss-output.txt
+            fi
+          else
+            touch kxss-results-${{ matrix.chunk }}/kxss-output.txt
+          fi
+      - name: Upload kxss results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kxss-results-chunk-${{ matrix.chunk }}
+          path: kxss-results-${{ matrix.chunk }}/
+
+  push-to-storage:
+    needs: [x8-scan, kxss-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup SSH and Git
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${DEPLOY_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results
+      - name: Push results to storage repo
+        run: |
+          git clone ${{ github.event.inputs.storage_repo }} storage
+          mkdir -p storage/${{ github.event.inputs.target_name }}/xss
+
+          X8_FILE="storage/${{ github.event.inputs.target_name }}/xss/x8-reflected.txt"
+          KXSS_FILE="storage/${{ github.event.inputs.target_name }}/xss/kxss-vulnerable.txt"
+
+          if [[ -d "all-results/x8-results-chunk-1" ]]; then
+            find all-results -type f -name "x8-reflected.txt" -exec cat {} + > "$X8_FILE"
+          fi
+
+          if [[ -d "all-results/kxss-results-chunk-1" ]]; then
+            find all-results -type f -name "kxss-output.txt" -exec cat {} + > "$KXSS_FILE"
+          fi
+
+          cd storage
+          git add .
+          if ! git diff --staged --quiet; then
+            git commit -m "Update XSS results for ${{ github.event.inputs.target_name }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
